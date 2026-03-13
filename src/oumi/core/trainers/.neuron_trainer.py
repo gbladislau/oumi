@@ -26,10 +26,10 @@ from typing import Any, cast
 import mlflow
 import pydantic
 import safetensors.torch
-import torch
 import torch.amp
 import torch.distributed.checkpoint as dcp
 import torch.utils.tensorboard as tensorboard
+import torch_neuronx as torch
 import wandb
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -126,11 +126,7 @@ class Trainer(BaseTrainer):
         self.params.finalize_and_validate()
 
         self.state = TrainingState()
-        if torch.accelerator.is_available():
-            self.device_type = torch.accelerator.current_accelerator()
-        else:
-            self.device_type = "cpu"
-        print(f"Using device type: {self.device_type}")
+        self.device_type = "neuron" if torch.cuda.is_available() else "cpu"
 
         # Enable mixed precision bf16/fp16 training if requested.
         # Model dtype has been verified to be fp32 if this is the case.
@@ -160,10 +156,9 @@ class Trainer(BaseTrainer):
 
         # TODO: OPE-218 - give users fine-grained control on device placement
         # TODO: OPE-217 - non-leader models should be on meta
-        if torch.accelerator.is_available():
-            self.device = f"{torch.accelerator.current_accelerator()}:"
-            f"{device_info.local_rank}"
-            torch.accelerator.set_device(self.device)
+        if torch.cuda.is_available():
+            self.device = f"cuda:{device_info.local_rank}"
+            torch.cuda.set_device(self.device)
         elif torch.backends.mps.is_available():
             self.device = "mps"
         else:
@@ -192,7 +187,7 @@ class Trainer(BaseTrainer):
         if self.params.compile:
             self.log("Compiling model...")
             with self._telemetry_block("compile model"):
-                model = cast(torch.nn.Module, torch.compile(model))
+                model = cast(torch.nn.Module, torch.compile(model, backend="neuron"))
         self.model = model
 
         self.callbacks = callbacks if callbacks is not None else []
@@ -290,17 +285,17 @@ class Trainer(BaseTrainer):
             yield (record_function_context, timer_context)
 
     @staticmethod
-    def _acc_sync_and_empty_cache() -> None:
-        if torch.accelerator.is_available() and torch.accelerator.is_initialized():
-            torch.accelerator.synchronize()
-            torch.accelerator.empty_cache()
+    def _cuda_sync_and_empty_cache() -> None:
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     def _train_epoch(self, progress_bar: tqdm) -> None:
         """Trains the model for one epoch."""
         epoch_start_time = time.perf_counter()
 
         self.model.train()
-        self._acc_sync_and_empty_cache()
+        self._cuda_sync_and_empty_cache()
         self.optimizer.zero_grad(set_to_none=True)
         micro_step = 0
 
@@ -488,7 +483,7 @@ class Trainer(BaseTrainer):
     #
     def save_model(self, config: TrainingConfig, final: bool = True) -> None:
         """Saves the model."""
-        self._acc_sync_and_empty_cache()
+        self._cuda_sync_and_empty_cache()
         if is_world_process_zero():
             output_dir = Path(config.training.output_dir)
             output_dir.mkdir(exist_ok=True)
@@ -507,11 +502,11 @@ class Trainer(BaseTrainer):
             if self._processor is not None:
                 self._processor.save_config(output_dir)
                 logger.info(f"Processor config has been saved at {output_dir}.")
-        self._acc_sync_and_empty_cache()
+        self._cuda_sync_and_empty_cache()
 
     def save_state(self):
         """Saves the training state."""
-        self._acc_sync_and_empty_cache()
+        self._cuda_sync_and_empty_cache()
         checkpoint_dir = Path(self.params.output_dir)
 
         if is_local_process_zero():
@@ -567,7 +562,7 @@ class Trainer(BaseTrainer):
             save_json(data=self.state.model_dump(), filename=trainer_state_path)
             logger.info(f"Training state saved to {checkpoint_dir}")
 
-        self._acc_sync_and_empty_cache()
+        self._cuda_sync_and_empty_cache()
 
     def _load_from_checkpoint(self, checkpoint_dirname: str):
         """Loads the training state from a checkpoint."""
